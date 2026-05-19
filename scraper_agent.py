@@ -16,18 +16,12 @@ log = logging.getLogger(__name__)
 SUPABASE_URL   = os.environ["SUPABASE_URL"]
 SUPABASE_KEY   = os.environ["SUPABASE_KEY"]
 TABLE_NAME     = os.environ.get("SUPABASE_TABLE", "leads")
-FOURSQUARE_KEY = os.environ["FOURSQUARE_API_KEY"]
+
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-FS_SEARCH_URL = "https://places-api.foursquare.com/places/search"
-FS_DETAIL_URL = "https://places-api.foursquare.com/places/{fsq_id}"
-
-FS_HEADERS = {
-    "Accept": "application/json",
-    "Accept-Encoding": "identity",
-    "Authorization": f"Bearer {FOURSQUARE_KEY}",
-    "X-Places-Api-Version": "2025-06-17",
+FOURSQUARE_KEY = "proxy"  # key lives in Vercel
+PROXY_URL      = os.environ.get("PROXY_URL", "https://blubalences.com/api/foursquare-proxy")
 }
 
 FALLBACK_JOBS = [
