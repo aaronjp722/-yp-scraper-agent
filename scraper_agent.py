@@ -8,6 +8,7 @@ import logging
 import schedule
 import time
 from datetime import datetime, date
+from urllib.parse import urljoin, urlparse
 from supabase import create_client, Client
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -17,7 +18,7 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 TABLE_NAME   = os.environ.get("SUPABASE_TABLE", "leads")
 YELP_KEY     = os.environ.get("YELP_API_KEY", "").strip()
-PROXY_URL    = os.environ.get("PROXY_URL", "https://blubalences.com/api/foursquare-proxy")
+PROXY_URL    = os.environ.get("PROXY_URL", "https://blubalances.com/api/foursquare-proxy")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -30,12 +31,28 @@ FALLBACK_JOBS = [
 ]
 
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
-SKIP_EMAIL_PREFIXES = ("noreply", "no-reply", "donotreply", "mailer", "bounce",
-                       "support", "help", "admin", "webmaster", "postmaster")
+OBFUSCATED_RE = re.compile(
+    r"([a-zA-Z0-9._%+\-]+)\s*[\[\(]?\s*(?:at|@)\s*[\]\)]?\s*([a-zA-Z0-9.\-]+)\s*[\[\(]?\s*(?:dot|\.)\s*[\]\)]?\s*([a-zA-Z]{2,})"
+)
+SKIP_PREFIXES = ("noreply","no-reply","donotreply","mailer","bounce",
+                 "support","help","admin","webmaster","postmaster","info@example")
+SKIP_DOMAINS  = ("sentry.io","wixpress.com","squarespace.com","shopify.com",
+                 "wordpress.com","example.com","domain.com","yourdomain.com",
+                 "email.com","test.com")
 SCRAPE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
 }
+
+CONTACT_PATHS = [
+    "", "/contact", "/contact-us", "/contactus", "/contact_us",
+    "/about", "/about-us", "/aboutus", "/about_us",
+    "/get-in-touch", "/reach-us", "/connect", "/hello",
+    "/team", "/our-team", "/staff", "/people",
+    "/info", "/information", "/support", "/help",
+    "/services", "/hire-us", "/work-with-us",
+]
 
 
 # ── Supabase helpers ──────────────────────────────────────────────────────────
@@ -79,7 +96,7 @@ def push_to_supabase(records, existing_phones):
         log.info("  -> No new records (all duplicates or no phone numbers)")
         return [], 0
     try:
-        supabase.table(TABLE_NAME).insert(new_records).execute()
+        result = supabase.table(TABLE_NAME).insert(new_records).execute()
         log.info(f"  -> Inserted {len(new_records)} new leads")
         return new_records, len(new_records)
     except Exception as e:
@@ -87,11 +104,11 @@ def push_to_supabase(records, existing_phones):
         return [], 0
 
 
-def update_email(lead_id, email):
+def update_email(telephone, email):
     try:
-        supabase.table(TABLE_NAME).update({"email": email}).eq("id", lead_id).execute()
+        supabase.table(TABLE_NAME).update({"email": email}).eq("telephone", telephone).execute()
     except Exception as e:
-        log.error(f"Email update failed for {lead_id}: {e}")
+        log.error(f"Email update failed: {e}")
 
 
 def make_tags(keyword, place, job_tags, source):
@@ -102,68 +119,121 @@ def make_tags(keyword, place, job_tags, source):
     return tags
 
 
-# ── Email scraping ────────────────────────────────────────────────────────────
+# ── Email extraction ──────────────────────────────────────────────────────────
 
-def extract_emails_from_html(html):
-    found = EMAIL_RE.findall(html)
+def clean_emails(raw_emails):
     clean = []
-    for e in found:
-        e = e.lower().strip(".")
-        if any(e.startswith(p) for p in SKIP_EMAIL_PREFIXES):
+    for e in raw_emails:
+        e = e.lower().strip(".").strip()
+        if not e or len(e) > 100:
             continue
-        if e.endswith((".png", ".jpg", ".gif", ".css", ".js")):
+        if any(e.startswith(p) for p in SKIP_PREFIXES):
+            continue
+        if e.endswith((".png", ".jpg", ".gif", ".css", ".js", ".svg", ".woff")):
+            continue
+        domain = e.split("@")[-1] if "@" in e else ""
+        if any(d in domain for d in SKIP_DOMAINS):
             continue
         if e not in clean:
             clean.append(e)
     return clean
 
 
+def extract_emails_from_html(html):
+    # 1. mailto: links — most reliable
+    mailto = re.findall(r'mailto:([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})', html)
+    # 2. plain email pattern
+    plain = EMAIL_RE.findall(html)
+    # 3. obfuscated: name [at] domain [dot] com
+    obfuscated = []
+    for m in OBFUSCATED_RE.finditer(html):
+        obfuscated.append(f"{m.group(1)}@{m.group(2)}.{m.group(3)}")
+    all_found = mailto + plain + obfuscated
+    return clean_emails(all_found)
+
+
+def get_domain_email_guesses(website):
+    """Generate common email patterns from domain as last resort."""
+    try:
+        domain = urlparse(website).netloc.replace("www.", "")
+        if not domain:
+            return []
+        return [f"info@{domain}", f"contact@{domain}", f"hello@{domain}"]
+    except Exception:
+        return []
+
+
+def fetch_page(url, timeout=8):
+    try:
+        resp = requests.get(url, headers=SCRAPE_HEADERS, timeout=timeout,
+                            allow_redirects=True, verify=False)
+        if resp.status_code == 200:
+            return resp.text
+    except Exception:
+        pass
+    return None
+
+
 def scrape_email_from_site(website):
     if not website:
         return None
+
     base = website.rstrip("/")
-    pages_to_try = [base, base + "/contact", base + "/contact-us", base + "/about"]
-    for url in pages_to_try:
-        try:
-            resp = requests.get(url, headers=SCRAPE_HEADERS, timeout=8, allow_redirects=True, verify=False)
-            if resp.status_code != 200:
-                continue
-            emails = extract_emails_from_html(resp.text)
-            if emails:
-                return emails[0]
-        except Exception:
+    # parse base domain for absolute URL building
+    parsed = urlparse(base)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+
+    found_emails = []
+
+    for path in CONTACT_PATHS:
+        url = urljoin(origin, path) if path else base
+        html = fetch_page(url)
+        if not html:
             continue
-        time.sleep(0.2)
+        emails = extract_emails_from_html(html)
+        if emails:
+            found_emails.extend(emails)
+            # if we found a mailto email already, stop early
+            if any(f"mailto:{e}" in html.lower() for e in emails):
+                break
+        time.sleep(0.15)
+
+        # Stop once we have candidates — don't crawl all pages unnecessarily
+        if len(found_emails) >= 3:
+            break
+
+    if found_emails:
+        return found_emails[0]
+
     return None
 
 
 def enrich_emails(inserted_records):
     if not inserted_records:
         return
-    websites = [(r.get("id"), r.get("website"), r.get("business_name"))
-                for r in inserted_records if r.get("website")]
-    if not websites:
-        log.info("  [Email] No websites to scrape")
+    with_sites = [(r.get("telephone"), r.get("website"), r.get("business_name"))
+                  for r in inserted_records if r.get("website")]
+    if not with_sites:
+        log.info("  [Email] No websites to crawl")
         return
 
-    log.info(f"  [Email] Scraping emails from {len(websites)} websites...")
+    log.info(f"  [Email] Crawling {len(with_sites)} websites for emails...")
     found = 0
-    for lead_id, website, name in websites:
+    for telephone, website, name in with_sites:
         email = scrape_email_from_site(website)
         if email:
-            update_email(lead_id, email)
+            update_email(telephone, email)
             log.info(f"  [Email] {name}: {email}")
             found += 1
-        time.sleep(0.3)
-    log.info(f"  [Email] Found {found}/{len(websites)} emails")
+        time.sleep(0.2)
+
+    log.info(f"  [Email] Found {found}/{len(with_sites)} emails")
 
 
 # ── Foursquare via Vercel proxy ───────────────────────────────────────────────
 
-def fetch_foursquare(keyword, place, cursor=None):
+def fetch_foursquare(keyword, place):
     params = {"query": keyword, "near": place}
-    if cursor:
-        params["cursor"] = cursor
     for attempt in range(3):
         try:
             resp = requests.get(PROXY_URL, params=params, timeout=20)
@@ -194,8 +264,8 @@ def parse_foursquare(venue, keyword, place, job_tags):
         "zipcode":        loc.get("postcode"),
         "category":       category,
         "rating":         venue.get("rating"),
-        "business_page":  f"https://foursquare.com/v/{venue.get('fsq_id', '')}",
-        "listing_url":    f"https://foursquare.com/v/{venue.get('fsq_id', '')}",
+        "business_page":  f"https://foursquare.com/v/{venue.get('fsq_id','')}",
+        "listing_url":    f"https://foursquare.com/v/{venue.get('fsq_id','')}",
         "search_keyword": keyword,
         "search_place":   place,
         "tags":           make_tags(keyword, place, job_tags, "foursquare"),
@@ -205,20 +275,11 @@ def parse_foursquare(venue, keyword, place, job_tags):
 
 def scrape_foursquare(keyword, place, job_tags):
     log.info(f"  [Foursquare] '{keyword}' near '{place}'")
-    results, cursor, pages = [], None, 0
-    while pages < 5:
-        venues = fetch_foursquare(keyword, place, cursor)
-        if venues is None:
-            log.warning("  [Foursquare] failed -- trying next provider")
-            return None
-        if not venues:
-            break
-        for v in venues:
-            results.append(parse_foursquare(v, keyword, place, job_tags))
-        pages += 1
-        if not cursor:
-            break
-        time.sleep(0.3)
+    venues = fetch_foursquare(keyword, place)
+    if venues is None:
+        log.warning("  [Foursquare] failed -- trying next provider")
+        return None
+    results = [parse_foursquare(v, keyword, place, job_tags) for v in venues]
     log.info(f"  [Foursquare] -> {len(results)} results")
     return results if results else None
 
