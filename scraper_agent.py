@@ -22,7 +22,11 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 FS_SEARCH_URL = "https://api.foursquare.com/v3/places/search"
 FS_DETAIL_URL = "https://api.foursquare.com/v3/places/{fsq_id}"
-FS_HEADERS    = {"Accept": "application/json", "Authorization": FOURSQUARE_KEY}
+FS_HEADERS = {
+    "Accept": "application/json",
+    "Accept-Encoding": "identity",
+    "Authorization": FOURSQUARE_KEY,
+}
 
 FALLBACK_JOBS = [
     {"keyword": "roofing contractors", "place": "Dallas,TX"},
@@ -70,11 +74,14 @@ def fetch_foursquare_page(keyword, place, cursor=None):
     for attempt in range(5):
         try:
             resp = requests.get(FS_SEARCH_URL, headers=FS_HEADERS, params=params, timeout=15)
+            if resp.status_code == 401:
+                log.error("Foursquare API key is invalid or missing — check FOURSQUARE_API_KEY env var")
+                return [], None
             if resp.status_code == 429:
                 time.sleep(2 ** attempt)
                 continue
             if resp.status_code != 200:
-                log.warning(f"HTTP {resp.status_code} on attempt {attempt+1}/5")
+                log.warning(f"HTTP {resp.status_code} on attempt {attempt+1}/5: {resp.text[:200]}")
                 time.sleep(2 ** attempt)
                 continue
             data = resp.json()
