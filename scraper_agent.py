@@ -8,23 +8,25 @@ import logging
 import schedule
 import time
 import urllib3
-from datetime import datetime, date
-from urllib.parse import urlparse
+from datetime import datetime, timezone, date
+from urllib.parse import urlparse, unquote
 from supabase import create_client, Client
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-SUPABASE_URL       = os.environ["SUPABASE_URL"]
-SUPABASE_KEY       = os.environ["SUPABASE_KEY"]
-TABLE_NAME         = os.environ.get("SUPABASE_TABLE", "leads")
-PROXY_URL          = os.environ.get("PROXY_URL", "https://blubalances.com/api/foursquare-proxy")
-YELP_KEY           = os.environ.get("YELP_API_KEY", "").strip()
-HERE_KEY           = os.environ.get("HERE_API_KEY", "").strip()
-YELP_FETCH_DETAILS = os.environ.get("YELP_FETCH_DETAILS", "true").lower() == "true"
+SUPABASE_URL  = os.environ["SUPABASE_URL"]
+SUPABASE_KEY  = os.environ["SUPABASE_KEY"]
+TABLE_NAME    = os.environ.get("SUPABASE_TABLE", "leads")
+PROXY_URL     = os.environ.get("PROXY_URL", "https://blubalances.com/api/foursquare-proxy")
+YELP_KEY      = os.environ.get("YELP_API_KEY", "").strip()
+HERE_KEY      = os.environ.get("HERE_API_KEY", "").strip()
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+def utcnow():
+    return datetime.now(timezone.utc).isoformat()
 
 FALLBACK_JOBS = [
     {"keyword": "roofing contractors", "place": "Dallas,TX"},
@@ -34,24 +36,34 @@ FALLBACK_JOBS = [
     {"keyword": "landscaping",         "place": "Dallas,TX"},
 ]
 
-EMAIL_SKIP_WORDS   = {"noreply", "no-reply", "donotreply", "mailer", "bounce",
-                      "support", "help", "admin", "webmaster", "postmaster"}
+EMAIL_SKIP_WORDS = {"noreply", "no-reply", "donotreply", "mailer", "bounce",
+                    "support", "help", "admin", "webmaster", "postmaster"}
 EMAIL_SKIP_DOMAINS = {"sentry.io", "wixpress.com", "squarespace.com",
                       "shopify.com", "wordpress.com", "example.com"}
-CRAWL_SKIP_DOMAINS = {"yelp.com", "www.yelp.com", "foursquare.com", "here.com",
-                      "facebook.com", "instagram.com", "google.com",
-                      "linkedin.com", "twitter.com", "tripadvisor.com",
-                      "yellowpages.com", "bbb.org", "angieslist.com"}
+DIRECTORY_DOMAINS  = {
+    "yelp.com", "yellowpages.com", "bbb.org", "facebook.com", "instagram.com",
+    "linkedin.com", "twitter.com", "google.com", "tripadvisor.com", "angi.com",
+    "angieslist.com", "homeadvisor.com", "thumbtack.com", "houzz.com",
+    "nextdoor.com", "manta.com", "superpages.com", "whitepages.com",
+    "foursquare.com", "mapquest.com", "merchantcircle.com", "here.com",
+    "bing.com", "yahoo.com", "duckduckgo.com", "chamberofcommerce.com",
+}
 EMAIL_PATHS = [
     "", "/contact", "/contact-us", "/contactus", "/contact_us",
     "/about", "/about-us", "/aboutus", "/about_us",
     "/get-in-touch", "/reach-us", "/connect", "/hello",
     "/team", "/our-team", "/staff", "/people",
-    "/info", "/information", "/support", "/help",
-    "/services", "/hire-us", "/work-with-us",
+    "/info", "/information", "/services", "/hire-us", "/work-with-us",
 ]
 
 _geocode_cache: dict = {}
+
+CRAWL_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept":          "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+}
 
 
 # ── Supabase helpers ──────────────────────────────────────────────────────────
@@ -105,11 +117,62 @@ def push_to_supabase(records, existing_phones):
         return [], 0
 
 
-def update_email(telephone, email):
+def _db_update(telephone, fields: dict):
     try:
-        supabase.table(TABLE_NAME).update({"email": email}).eq("telephone", telephone).execute()
+        supabase.table(TABLE_NAME).update(fields).eq("telephone", telephone).execute()
     except Exception as e:
-        log.error(f"Email update failed for {telephone}: {e}")
+        log.error(f"DB update failed for {telephone}: {e}")
+
+
+# ── Website discovery via DuckDuckGo ─────────────────────────────────────────
+def _is_business_url(url: str) -> bool:
+    try:
+        netloc = urlparse(url).netloc.lower().replace("www.", "")
+        return bool(netloc) and not any(
+            netloc == d or netloc.endswith("." + d) for d in DIRECTORY_DOMAINS
+        )
+    except Exception:
+        return False
+
+
+def discover_website(business_name: str, locality: str, region: str = "") -> str | None:
+    query = f'"{business_name}" {locality} {region}'.strip()
+    try:
+        resp = requests.get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": query},
+            headers=CRAWL_HEADERS,
+            timeout=12,
+        )
+        if resp.status_code != 200:
+            return None
+        for encoded in re.findall(r'uddg=([^&"\']+)', resp.text)[:8]:
+            url = unquote(encoded)
+            if url.startswith("http") and _is_business_url(url):
+                return url.split("?")[0].rstrip("/")
+    except Exception as e:
+        log.debug(f"DDG discover failed for '{business_name}': {e}")
+    return None
+
+
+def enrich_websites(inserted_records):
+    no_site = [r for r in inserted_records
+               if not r.get("website") and r.get("telephone") and r.get("business_name")]
+    if not no_site:
+        return
+    log.info(f"  [WebDiscover] Searching websites for {len(no_site)} leads...")
+    found = 0
+    for rec in no_site:
+        site = discover_website(rec["business_name"],
+                                rec.get("locality", ""),
+                                rec.get("region", ""))
+        if site:
+            _db_update(rec["telephone"], {"website": site})
+            rec["website"] = site
+            found += 1
+            log.info(f"  [WebDiscover] {rec['business_name']} -> {site}")
+        time.sleep(0.6)
+    log.info(f"  [WebDiscover] Found {found}/{len(no_site)} websites")
 
 
 # ── Email crawler ─────────────────────────────────────────────────────────────
@@ -119,12 +182,6 @@ OBFUS_RE = re.compile(
     r"([a-zA-Z0-9.\-]+)\s*[\[\(]?\s*dot\s*[\]\)]?\s*([a-zA-Z]{2,})",
     re.IGNORECASE,
 )
-CRAWL_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-}
 
 
 def _is_valid_email(email: str) -> bool:
@@ -162,12 +219,12 @@ def _extract_emails(html: str) -> set:
 def crawl_email(website: str) -> str | None:
     if not website:
         return None
-    base = website.rstrip("/")
-    parsed = urlparse(base if "://" in base else "https://" + base)
+    base   = website if "://" in website else "https://" + website
+    parsed = urlparse(base.rstrip("/"))
     if not parsed.netloc:
         return None
     netloc = parsed.netloc.lower()
-    if any(netloc == d or netloc.endswith("." + d) for d in CRAWL_SKIP_DOMAINS):
+    if any(netloc == d or netloc.endswith("." + d) for d in DIRECTORY_DOMAINS):
         return None
 
     session = requests.Session()
@@ -176,10 +233,10 @@ def crawl_email(website: str) -> str | None:
 
     for path in EMAIL_PATHS:
         try:
-            resp = session.get(f"{parsed.scheme}://{parsed.netloc}{path}",
-                               timeout=8, allow_redirects=True)
-            if resp.status_code == 200:
-                found.update(_extract_emails(resp.text))
+            r = session.get(f"{parsed.scheme}://{parsed.netloc}{path}",
+                            timeout=8, allow_redirects=True)
+            if r.status_code == 200:
+                found.update(_extract_emails(r.text))
                 if found:
                     break
         except Exception:
@@ -189,25 +246,25 @@ def crawl_email(website: str) -> str | None:
     if not found:
         return None
     preferred = [e for e in found
-                 if not any(w in e.split("@")[0] for w in {"info", "contact", "hello", "support"})]
-    pool = preferred or list(found)
-    return min(pool, key=len)
+                 if not any(w in e.split("@")[0]
+                            for w in {"info", "contact", "hello", "support"})]
+    return min(preferred or list(found), key=len)
 
 
 def enrich_emails(inserted_records):
-    if not inserted_records:
-        return
     eligible = [r for r in inserted_records if r.get("website") and r.get("telephone")]
-    log.info(f"  [Email] Crawling {len(eligible)}/{len(inserted_records)} leads with websites...")
-    found_count = 0
+    if not eligible:
+        return
+    log.info(f"  [Email] Crawling {len(eligible)} leads with websites...")
+    found = 0
     for rec in eligible:
         email = crawl_email(rec["website"])
         if email:
-            update_email(rec["telephone"], email)
-            found_count += 1
+            _db_update(rec["telephone"], {"email": email})
+            found += 1
             log.info(f"  [Email] {rec.get('business_name', '?')} -> {email}")
         time.sleep(0.2)
-    log.info(f"  [Email] Found {found_count}/{len(eligible)} emails")
+    log.info(f"  [Email] Found {found}/{len(eligible)} emails")
 
 
 # ── Provider: Foursquare (Vercel proxy) ──────────────────────────────────────
@@ -215,16 +272,19 @@ def scrape_foursquare(keyword, place, job_tags):
     if not PROXY_URL:
         return None
     log.info(f"  [Foursquare] '{keyword}' near '{place}'")
-    results = []
     for attempt in range(3):
         try:
-            resp = requests.get(PROXY_URL, params={"query": keyword, "near": place}, timeout=20)
+            resp = requests.get(PROXY_URL,
+                                params={"query": keyword, "near": place},
+                                timeout=20)
             if resp.status_code == 401:
                 log.error("  [Foursquare] invalid API key"); return None
             if resp.status_code != 200:
-                log.warning(f"  [Foursquare] HTTP {resp.status_code}"); time.sleep(2**attempt); continue
-            venues = resp.json().get("results", [])
-            today  = date.today().isoformat()
+                log.warning(f"  [Foursquare] HTTP {resp.status_code}")
+                time.sleep(2 ** attempt); continue
+            venues  = resp.json().get("results", [])
+            today   = date.today().isoformat()
+            results = []
             for v in venues:
                 loc  = v.get("location", {})
                 tags = list(job_tags)
@@ -245,13 +305,13 @@ def scrape_foursquare(keyword, place, job_tags):
                     "search_keyword": keyword,
                     "search_place":   place,
                     "tags":           tags,
-                    "scraped_at":     datetime.utcnow().isoformat(),
+                    "scraped_at":     utcnow(),
                 })
             log.info(f"  [Foursquare] -> {len(results)} results")
-            return results
+            return results or None
         except Exception as e:
             log.warning(f"  [Foursquare] attempt {attempt+1} failed: {e}")
-            time.sleep(2**attempt)
+            time.sleep(2 ** attempt)
     return None
 
 
@@ -260,15 +320,15 @@ HERE_GEOCODE_URL  = "https://geocode.search.hereapi.com/v1/geocode"
 HERE_DISCOVER_URL = "https://discover.search.hereapi.com/v1/discover"
 
 
-def _here_geocode(place: str) -> tuple[float, float] | None:
+def _here_geocode(place: str) -> tuple | None:
     if place in _geocode_cache:
         return _geocode_cache[place]
     try:
-        resp = requests.get(HERE_GEOCODE_URL,
-                            params={"q": place, "apiKey": HERE_KEY}, timeout=10)
-        items = resp.json().get("items", [])
+        r = requests.get(HERE_GEOCODE_URL,
+                         params={"q": place, "apiKey": HERE_KEY}, timeout=10)
+        items = r.json().get("items", [])
         if items:
-            pos = items[0]["position"]
+            pos    = items[0]["position"]
             coords = (pos["lat"], pos["lng"])
             _geocode_cache[place] = coords
             return coords
@@ -283,29 +343,25 @@ def scrape_here(keyword, place, job_tags):
     log.info(f"  [HERE] '{keyword}' near '{place}'")
     coords = _here_geocode(place)
     if not coords:
-        log.warning(f"  [HERE] could not geocode '{place}'")
-        return None
+        log.warning(f"  [HERE] could not geocode '{place}'"); return None
 
-    results, offset, page_size = [], 0, 100
-    today = date.today().isoformat()
-
-    while offset < 500:
+    results, today = [], date.today().isoformat()
+    for offset in range(0, 500, 100):
         try:
-            resp = requests.get(HERE_DISCOVER_URL, params={
+            r = requests.get(HERE_DISCOVER_URL, params={
                 "q":      keyword,
                 "at":     f"{coords[0]},{coords[1]}",
-                "limit":  page_size,
+                "limit":  100,
                 "apiKey": HERE_KEY,
             }, timeout=15)
-            if resp.status_code != 200:
-                log.warning(f"  [HERE] HTTP {resp.status_code}: {resp.text[:200]}")
-                break
-            items = resp.json().get("items", [])
+            if r.status_code != 200:
+                log.warning(f"  [HERE] HTTP {r.status_code}"); break
+            items = r.json().get("items", [])
             if not items:
                 break
             for item in items:
                 addr     = item.get("address", {})
-                contacts = item.get("contacts", [{}])[0] if item.get("contacts") else {}
+                contacts = (item.get("contacts") or [{}])[0]
                 phones   = contacts.get("phone", [])
                 websites = contacts.get("www", [])
                 phone    = phones[0].get("value") if phones else None
@@ -328,57 +384,45 @@ def scrape_here(keyword, place, job_tags):
                     "search_keyword": keyword,
                     "search_place":   place,
                     "tags":           tags,
-                    "scraped_at":     datetime.utcnow().isoformat(),
+                    "scraped_at":     utcnow(),
                 })
-            offset += len(items)
-            if len(items) < page_size:
+            if len(items) < 100:
                 break
             time.sleep(0.3)
         except Exception as e:
-            log.warning(f"  [HERE] failed: {e}")
-            break
+            log.warning(f"  [HERE] failed: {e}"); break
 
-    log.info(f"  [HERE] -> {len(results)} results")
+    log.info(f"  [HERE] -> {len(results)} results "
+             f"({sum(1 for r in results if r['website'])} with websites)")
     return results or None
 
 
 # ── Provider: Yelp ────────────────────────────────────────────────────────────
-YELP_SEARCH_URL  = "https://api.yelp.com/v3/businesses/search"
-YELP_DETAIL_URL  = "https://api.yelp.com/v3/businesses/{}"
-YELP_HEADERS     = lambda: {"Authorization": f"Bearer {YELP_KEY}", "Accept": "application/json"}
-
-
-def _yelp_business_website(biz_id: str) -> str | None:
-    try:
-        resp = requests.get(YELP_DETAIL_URL.format(biz_id),
-                            headers=YELP_HEADERS(), timeout=10)
-        if resp.status_code == 200:
-            return resp.json().get("url") or None  # still yelp URL if no website
-    except Exception:
-        pass
-    return None
+YELP_SEARCH_URL = "https://api.yelp.com/v3/businesses/search"
 
 
 def scrape_yelp(keyword, place, job_tags):
     if not YELP_KEY:
         return None
     log.info(f"  [Yelp] '{keyword}' near '{place}'")
-    all_biz, offset = [], 0
-    today = date.today().isoformat()
+    all_biz, offset, today = [], 0, date.today().isoformat()
 
     while offset < 200:
         for attempt in range(3):
             try:
-                resp = requests.get(YELP_SEARCH_URL,
-                                    headers=YELP_HEADERS(),
-                                    params={"term": keyword, "location": place,
-                                            "limit": 50, "offset": offset},
-                                    timeout=15)
+                resp = requests.get(
+                    YELP_SEARCH_URL,
+                    headers={"Authorization": f"Bearer {YELP_KEY}"},
+                    params={"term": keyword, "location": place,
+                            "limit": 50, "offset": offset},
+                    timeout=15,
+                )
                 if resp.status_code == 401:
                     log.error("  [Yelp] invalid API key"); return None
                 if resp.status_code != 200:
-                    log.warning(f"  [Yelp] HTTP {resp.status_code}"); time.sleep(2**attempt); continue
-                data = resp.json()
+                    log.warning(f"  [Yelp] HTTP {resp.status_code}")
+                    time.sleep(2 ** attempt); continue
+                data       = resp.json()
                 businesses = data.get("businesses", [])
                 total      = data.get("total", 0)
                 all_biz.extend(businesses)
@@ -387,36 +431,20 @@ def scrape_yelp(keyword, place, job_tags):
                     offset = 9999
                 break
             except Exception as e:
-                log.warning(f"  [Yelp] attempt {attempt+1}: {e}"); time.sleep(2**attempt)
+                log.warning(f"  [Yelp] attempt {attempt+1}: {e}")
+                time.sleep(2 ** attempt)
         time.sleep(0.3)
 
     results = []
-    fetch_detail = YELP_FETCH_DETAILS
-    if fetch_detail:
-        log.info(f"  [Yelp] Fetching details for {len(all_biz)} businesses to get website URLs...")
-
     for biz in all_biz:
-        loc     = biz.get("location", {})
-        phone   = biz.get("phone") or biz.get("display_phone")
-        website = None
-
-        if fetch_detail and biz.get("id"):
-            detail_resp = requests.get(YELP_DETAIL_URL.format(biz["id"]),
-                                       headers=YELP_HEADERS(), timeout=10)
-            if detail_resp.status_code == 200:
-                raw_site = detail_resp.json().get("website")
-                if raw_site and "yelp.com" not in raw_site:
-                    website = raw_site
-            time.sleep(0.15)
-
+        loc  = biz.get("location", {})
         tags = list(job_tags)
         for t in [keyword, place, today, "yelp"]:
             if t and t not in tags: tags.append(t)
-
         results.append({
             "business_name":  biz.get("name"),
-            "telephone":      phone,
-            "website":        website,
+            "telephone":      biz.get("phone") or biz.get("display_phone"),
+            "website":        None,  # Yelp search API doesn't return business websites
             "street":         (loc.get("display_address") or [None])[0],
             "locality":       loc.get("city"),
             "region":         loc.get("state"),
@@ -428,11 +456,10 @@ def scrape_yelp(keyword, place, job_tags):
             "search_keyword": keyword,
             "search_place":   place,
             "tags":           tags,
-            "scraped_at":     datetime.utcnow().isoformat(),
+            "scraped_at":     utcnow(),
         })
 
-    log.info(f"  [Yelp] -> {len(results)} results "
-             f"({sum(1 for r in results if r['website'])} with websites)")
+    log.info(f"  [Yelp] -> {len(results)} results")
     return results or None
 
 
@@ -445,25 +472,20 @@ PROVIDERS = [
 
 
 def scrape_with_fallback(keyword, place, job_tags):
-    all_results = []
-    seen_phones = set()
-
+    all_results, seen_phones = [], set()
     for name, fn in PROVIDERS:
         try:
             results = fn(keyword, place, job_tags)
         except Exception as e:
             log.error(f"  [{name}] crashed: {e}"); results = None
-
         if not results:
             log.info(f"  [{name}] empty/failed -- trying next provider")
             continue
-
-        # Deduplicate across providers by phone
-        new = [r for r in results if r.get("telephone") and r["telephone"] not in seen_phones]
+        new = [r for r in results
+               if r.get("telephone") and r["telephone"] not in seen_phones]
         seen_phones.update(r["telephone"] for r in new if r.get("telephone"))
         all_results.extend(new)
         log.info(f"  [{name}] contributed {len(new)} unique results")
-
     if not all_results:
         log.error(f"  All providers failed for '{keyword}' / '{place}'")
     return all_results
@@ -472,10 +494,8 @@ def scrape_with_fallback(keyword, place, job_tags):
 # ── Main agent ────────────────────────────────────────────────────────────────
 def run_agent():
     log.info("=" * 60)
-    log.info(f"Agent started -- {datetime.utcnow().isoformat()} UTC")
+    log.info(f"Agent started -- {utcnow()} UTC")
     log.info(f"Providers: Foursquare={bool(PROXY_URL)} | HERE={'yes' if HERE_KEY else 'no'} | Yelp={'yes' if YELP_KEY else 'no'}")
-    log.info(f"Yelp detail lookups: {'enabled' if YELP_FETCH_DETAILS else 'disabled'}")
-
     jobs            = load_jobs()
     existing_phones = get_existing_phones()
     log.info(f"Existing leads in DB: {len(existing_phones)}")
@@ -483,12 +503,13 @@ def run_agent():
 
     for job in jobs:
         log.info(f"Job: '{job['keyword']}' / '{job['place']}'")
-        records = scrape_with_fallback(job["keyword"], job["place"], job.get("tags", []))
-        inserted_records, count = push_to_supabase(records, existing_phones)
+        records                    = scrape_with_fallback(job["keyword"], job["place"], job.get("tags", []))
+        inserted_records, count    = push_to_supabase(records, existing_phones)
         total_scraped  += len(records)
         total_inserted += count
         existing_phones.update(r["telephone"] for r in records if r.get("telephone"))
-        enrich_emails(inserted_records)
+        enrich_websites(inserted_records)   # find websites for leads missing them
+        enrich_emails(inserted_records)     # crawl websites for emails
 
     log.info(f"Done. Scraped: {total_scraped} | Inserted: {total_inserted}")
     log.info("=" * 60)
