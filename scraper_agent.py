@@ -3,6 +3,7 @@
 
 import requests
 import os
+import re
 import logging
 import schedule
 import time
@@ -28,6 +29,16 @@ FALLBACK_JOBS = [
     {"keyword": "landscaping",         "place": "Dallas,TX"},
 ]
 
+EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
+SKIP_EMAIL_PREFIXES = ("noreply", "no-reply", "donotreply", "mailer", "bounce",
+                       "support", "help", "admin", "webmaster", "postmaster")
+SCRAPE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+
+# ── Supabase helpers ──────────────────────────────────────────────────────────
 
 def load_config():
     defaults = {"SCHEDULE": "weekly", "RUN_HOUR": "06:00", "INTERVAL_HOURS": "24"}
@@ -58,7 +69,7 @@ def get_existing_phones():
         resp = supabase.table(TABLE_NAME).select("telephone").execute()
         return {row["telephone"] for row in resp.data if row.get("telephone")}
     except Exception as e:
-        log.error(f"Could not fetch existing leads: {e}")
+        log.error(f"Could not fetch existing phones: {e}")
         return set()
 
 
@@ -66,14 +77,21 @@ def push_to_supabase(records, existing_phones):
     new_records = [r for r in records if r.get("telephone") and r["telephone"] not in existing_phones]
     if not new_records:
         log.info("  -> No new records (all duplicates or no phone numbers)")
-        return 0
+        return [], 0
     try:
         supabase.table(TABLE_NAME).insert(new_records).execute()
         log.info(f"  -> Inserted {len(new_records)} new leads")
-        return len(new_records)
+        return new_records, len(new_records)
     except Exception as e:
         log.error(f"Supabase insert failed: {e}")
-        return 0
+        return [], 0
+
+
+def update_email(lead_id, email):
+    try:
+        supabase.table(TABLE_NAME).update({"email": email}).eq("id", lead_id).execute()
+    except Exception as e:
+        log.error(f"Email update failed for {lead_id}: {e}")
 
 
 def make_tags(keyword, place, job_tags, source):
@@ -82,6 +100,62 @@ def make_tags(keyword, place, job_tags, source):
         if t and t not in tags:
             tags.append(t)
     return tags
+
+
+# ── Email scraping ────────────────────────────────────────────────────────────
+
+def extract_emails_from_html(html):
+    found = EMAIL_RE.findall(html)
+    clean = []
+    for e in found:
+        e = e.lower().strip(".")
+        if any(e.startswith(p) for p in SKIP_EMAIL_PREFIXES):
+            continue
+        if e.endswith((".png", ".jpg", ".gif", ".css", ".js")):
+            continue
+        if e not in clean:
+            clean.append(e)
+    return clean
+
+
+def scrape_email_from_site(website):
+    if not website:
+        return None
+    base = website.rstrip("/")
+    pages_to_try = [base, base + "/contact", base + "/contact-us", base + "/about"]
+    for url in pages_to_try:
+        try:
+            resp = requests.get(url, headers=SCRAPE_HEADERS, timeout=8, allow_redirects=True, verify=False)
+            if resp.status_code != 200:
+                continue
+            emails = extract_emails_from_html(resp.text)
+            if emails:
+                return emails[0]
+        except Exception:
+            continue
+        time.sleep(0.2)
+    return None
+
+
+def enrich_emails(inserted_records):
+    if not inserted_records:
+        return
+    websites = [(r.get("id"), r.get("website"), r.get("business_name"))
+                for r in inserted_records if r.get("website")]
+    if not websites:
+        log.info("  [Email] No websites to scrape")
+        return
+
+    log.info(f"  [Email] Scraping emails from {len(websites)} websites...")
+    found = 0
+    for lead_id, website, name in websites:
+        email = scrape_email_from_site(website)
+        if email:
+            update_email(lead_id, email)
+            log.info(f"  [Email] {name}: {email}")
+            found += 1
+        time.sleep(0.3)
+    log.info(f"  [Email] Found {found}/{len(websites)} emails")
 
 
 # ── Foursquare via Vercel proxy ───────────────────────────────────────────────
@@ -142,7 +216,6 @@ def scrape_foursquare(keyword, place, job_tags):
         for v in venues:
             results.append(parse_foursquare(v, keyword, place, job_tags))
         pages += 1
-        cursor = None
         if not cursor:
             break
         time.sleep(0.3)
@@ -246,12 +319,16 @@ def run_agent():
     existing_phones = get_existing_phones()
     log.info(f"Existing leads in DB: {len(existing_phones)}")
     total_scraped = total_inserted = 0
+
     for job in jobs:
         log.info(f"Job: '{job['keyword']}' / '{job['place']}'")
         records = scrape_with_fallback(job["keyword"], job["place"], job.get("tags", []))
-        total_scraped  += len(records)
-        total_inserted += push_to_supabase(records, existing_phones)
+        total_scraped += len(records)
+        inserted_records, count = push_to_supabase(records, existing_phones)
+        total_inserted += count
         existing_phones.update(r["telephone"] for r in records if r.get("telephone"))
+        enrich_emails(inserted_records)
+
     log.info(f"Done. Scraped: {total_scraped} | Inserted: {total_inserted}")
     log.info("=" * 60)
 
