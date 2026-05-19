@@ -121,6 +121,11 @@ HEADERS  = {
 
 def _is_valid_email(email: str) -> bool:
     local, _, domain = email.partition("@")
+    if not local or not domain or "." not in domain:
+        return False
+    tld = domain.rsplit(".", 1)[-1]
+    if not re.match(r"^[a-zA-Z]{2,6}$", tld):  # rejects "handleredirect", etc.
+        return False
     if any(w in local.lower() for w in EMAIL_SKIP_WORDS):
         return False
     if domain.lower() in EMAIL_SKIP_DOMAINS:
