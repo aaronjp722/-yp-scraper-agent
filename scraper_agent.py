@@ -7,18 +7,20 @@ import re
 import logging
 import schedule
 import time
+import urllib3
 from datetime import datetime, date
 from urllib.parse import urljoin, urlparse
 from supabase import create_client, Client
 
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_KEY = os.environ["SUPABASE_KEY"]
-TABLE_NAME   = os.environ.get("SUPABASE_TABLE", "leads")
-YELP_KEY     = os.environ.get("YELP_API_KEY", "").strip()
-PROXY_URL    = os.environ.get("PROXY_URL", "https://blubalances.com/api/foursquare-proxy")
+SUPABASE_URL    = os.environ["SUPABASE_URL"]
+SUPABASE_KEY    = os.environ["SUPABASE_KEY"]
+TABLE_NAME      = os.environ.get("SUPABASE_TABLE", "leads")
+PROXY_URL       = os.environ.get("PROXY_URL", "https://blubalances.com/api/foursquare-proxy")
+YELP_KEY        = os.environ.get("YELP_API_KEY", "").strip()
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -30,22 +32,15 @@ FALLBACK_JOBS = [
     {"keyword": "landscaping",         "place": "Dallas,TX"},
 ]
 
-EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
-OBFUSCATED_RE = re.compile(
-    r"([a-zA-Z0-9._%+\-]+)\s*[\[\(]?\s*(?:at|@)\s*[\]\)]?\s*([a-zA-Z0-9.\-]+)\s*[\[\(]?\s*(?:dot|\.)\s*[\]\)]?\s*([a-zA-Z]{2,})"
-)
-SKIP_PREFIXES = ("noreply","no-reply","donotreply","mailer","bounce",
-                 "support","help","admin","webmaster","postmaster","info@example")
-SKIP_DOMAINS  = ("sentry.io","wixpress.com","squarespace.com","shopify.com",
-                 "wordpress.com","example.com","domain.com","yourdomain.com",
-                 "email.com","test.com")
-SCRAPE_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-}
-
-CONTACT_PATHS = [
+EMAIL_SKIP_WORDS   = {"noreply", "no-reply", "donotreply", "mailer", "bounce",
+                      "support", "help", "admin", "webmaster", "postmaster"}
+EMAIL_SKIP_DOMAINS = {"sentry.io", "wixpress.com", "squarespace.com",
+                      "shopify.com", "wordpress.com", "example.com"}
+CRAWL_SKIP_DOMAINS = {"yelp.com", "www.yelp.com", "foursquare.com",
+                      "facebook.com", "instagram.com", "google.com",
+                      "maps.google.com", "linkedin.com", "twitter.com",
+                      "tripadvisor.com", "yellowpages.com"}
+EMAIL_PATHS = [
     "", "/contact", "/contact-us", "/contactus", "/contact_us",
     "/about", "/about-us", "/aboutus", "/about_us",
     "/get-in-touch", "/reach-us", "/connect", "/hello",
@@ -56,7 +51,6 @@ CONTACT_PATHS = [
 
 
 # ── Supabase helpers ──────────────────────────────────────────────────────────
-
 def load_config():
     defaults = {"SCHEDULE": "weekly", "RUN_HOUR": "06:00", "INTERVAL_HOURS": "24"}
     try:
@@ -86,7 +80,7 @@ def get_existing_phones():
         resp = supabase.table(TABLE_NAME).select("telephone").execute()
         return {row["telephone"] for row in resp.data if row.get("telephone")}
     except Exception as e:
-        log.error(f"Could not fetch existing phones: {e}")
+        log.error(f"Could not fetch existing leads: {e}")
         return set()
 
 
@@ -96,9 +90,10 @@ def push_to_supabase(records, existing_phones):
         log.info("  -> No new records (all duplicates or no phone numbers)")
         return [], 0
     try:
-        result = supabase.table(TABLE_NAME).insert(new_records).execute()
-        log.info(f"  -> Inserted {len(new_records)} new leads")
-        return new_records, len(new_records)
+        resp = supabase.table(TABLE_NAME).insert(new_records).execute()
+        inserted = resp.data if resp.data else []
+        log.info(f"  -> Inserted {len(inserted)} new leads")
+        return inserted, len(inserted)
     except Exception as e:
         log.error(f"Supabase insert failed: {e}")
         return [], 0
@@ -108,137 +103,113 @@ def update_email(telephone, email):
     try:
         supabase.table(TABLE_NAME).update({"email": email}).eq("telephone", telephone).execute()
     except Exception as e:
-        log.error(f"Email update failed: {e}")
+        log.error(f"Email update failed for {telephone}: {e}")
 
 
-def make_tags(keyword, place, job_tags, source):
-    tags = list(job_tags)
-    for t in [keyword, place, date.today().isoformat(), source]:
-        if t and t not in tags:
-            tags.append(t)
-    return tags
+# ── Email crawler ─────────────────────────────────────────────────────────────
+EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
+OBFUS_RE = re.compile(
+    r"([a-zA-Z0-9._%+\-]+)\s*[\[\(]?\s*at\s*[\]\)]?\s*"
+    r"([a-zA-Z0-9.\-]+)\s*[\[\(]?\s*dot\s*[\]\)]?\s*([a-zA-Z]{2,})",
+    re.IGNORECASE,
+)
+HEADERS  = {
+    "User-Agent": "Mozilla/5.0 (compatible; LeadBot/1.0)",
+    "Accept":     "text/html,application/xhtml+xml",
+}
 
 
-# ── Email extraction ──────────────────────────────────────────────────────────
-
-def clean_emails(raw_emails):
-    clean = []
-    for e in raw_emails:
-        e = e.lower().strip(".").strip()
-        if not e or len(e) > 100:
-            continue
-        if any(e.startswith(p) for p in SKIP_PREFIXES):
-            continue
-        if e.endswith((".png", ".jpg", ".gif", ".css", ".js", ".svg", ".woff")):
-            continue
-        domain = e.split("@")[-1] if "@" in e else ""
-        if any(d in domain for d in SKIP_DOMAINS):
-            continue
-        if e not in clean:
-            clean.append(e)
-    return clean
+def _is_valid_email(email: str) -> bool:
+    local, _, domain = email.partition("@")
+    if any(w in local.lower() for w in EMAIL_SKIP_WORDS):
+        return False
+    if domain.lower() in EMAIL_SKIP_DOMAINS:
+        return False
+    if "example" in domain.lower():
+        return False
+    return True
 
 
-def extract_emails_from_html(html):
-    # 1. mailto: links — most reliable
-    mailto = re.findall(r'mailto:([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})', html)
-    # 2. plain email pattern
-    plain = EMAIL_RE.findall(html)
-    # 3. obfuscated: name [at] domain [dot] com
-    obfuscated = []
-    for m in OBFUSCATED_RE.finditer(html):
-        obfuscated.append(f"{m.group(1)}@{m.group(2)}.{m.group(3)}")
-    all_found = mailto + plain + obfuscated
-    return clean_emails(all_found)
+def _extract_from_html(html: str) -> set:
+    found = set()
+    for href in re.findall(r'href=["\']mailto:([^"\'?\s]+)', html, re.IGNORECASE):
+        email = href.split("?")[0].strip()
+        if EMAIL_RE.match(email) and _is_valid_email(email):
+            found.add(email.lower())
+    for email in EMAIL_RE.findall(html):
+        if _is_valid_email(email):
+            found.add(email.lower())
+    for m in OBFUS_RE.finditer(html):
+        email = f"{m.group(1)}@{m.group(2)}.{m.group(3)}"
+        if _is_valid_email(email):
+            found.add(email.lower())
+    return found
 
 
-def get_domain_email_guesses(website):
-    """Generate common email patterns from domain as last resort."""
-    try:
-        domain = urlparse(website).netloc.replace("www.", "")
-        if not domain:
-            return []
-        return [f"info@{domain}", f"contact@{domain}", f"hello@{domain}"]
-    except Exception:
-        return []
-
-
-def fetch_page(url, timeout=8):
-    try:
-        resp = requests.get(url, headers=SCRAPE_HEADERS, timeout=timeout,
-                            allow_redirects=True, verify=False)
-        if resp.status_code == 200:
-            return resp.text
-    except Exception:
-        pass
-    return None
-
-
-def scrape_email_from_site(website):
+def crawl_email(website: str) -> str | None:
     if not website:
         return None
-
     base = website.rstrip("/")
-    # parse base domain for absolute URL building
     parsed = urlparse(base)
-    origin = f"{parsed.scheme}://{parsed.netloc}"
+    if not parsed.scheme:
+        base = "https://" + base
+        parsed = urlparse(base)
+    if not parsed.netloc:
+        return None
+    if parsed.netloc in CRAWL_SKIP_DOMAINS or any(parsed.netloc.endswith('.'+d) for d in CRAWL_SKIP_DOMAINS):
+        return None
 
-    found_emails = []
+    found: set = set()
+    session = requests.Session()
+    session.headers.update(HEADERS)
 
-    for path in CONTACT_PATHS:
-        url = urljoin(origin, path) if path else base
-        html = fetch_page(url)
-        if not html:
-            continue
-        emails = extract_emails_from_html(html)
-        if emails:
-            found_emails.extend(emails)
-            # if we found a mailto email already, stop early
-            if any(f"mailto:{e}" in html.lower() for e in emails):
-                break
-        time.sleep(0.15)
+    for path in EMAIL_PATHS:
+        url = base + path
+        try:
+            resp = session.get(url, timeout=8, allow_redirects=True)
+            if resp.status_code == 200:
+                emails = _extract_from_html(resp.text)
+                found.update(emails)
+                if found:
+                    break
+        except Exception:
+            pass
+        time.sleep(0.1)
 
-        # Stop once we have candidates — don't crawl all pages unnecessarily
-        if len(found_emails) >= 3:
-            break
-
-    if found_emails:
-        return found_emails[0]
-
-    return None
+    if not found:
+        return None
+    preferred = [e for e in found if not any(w in e.split("@")[0] for w in {"info", "contact", "hello", "support"})]
+    pool = preferred or list(found)
+    return min(pool, key=len)
 
 
 def enrich_emails(inserted_records):
     if not inserted_records:
         return
-    with_sites = [(r.get("telephone"), r.get("website"), r.get("business_name"))
-                  for r in inserted_records if r.get("website")]
-    if not with_sites:
-        log.info("  [Email] No websites to crawl")
-        return
-
-    log.info(f"  [Email] Crawling {len(with_sites)} websites for emails...")
-    found = 0
-    for telephone, website, name in with_sites:
-        email = scrape_email_from_site(website)
+    log.info(f"  [Email] Enriching {len(inserted_records)} new leads...")
+    found_count = 0
+    for rec in inserted_records:
+        website   = rec.get("website")
+        telephone = rec.get("telephone")
+        if not website or not telephone:
+            continue
+        email = crawl_email(website)
         if email:
             update_email(telephone, email)
-            log.info(f"  [Email] {name}: {email}")
-            found += 1
+            found_count += 1
+            log.info(f"  [Email] {rec.get('business_name','?')} -> {email}")
         time.sleep(0.2)
+    log.info(f"  [Email] Found emails for {found_count}/{len(inserted_records)} leads")
 
-    log.info(f"  [Email] Found {found}/{len(with_sites)} emails")
 
-
-# ── Foursquare via Vercel proxy ───────────────────────────────────────────────
-
+# ── Provider: Foursquare (via Vercel proxy) ───────────────────────────────────
 def fetch_foursquare(keyword, place):
     params = {"query": keyword, "near": place}
     for attempt in range(3):
         try:
             resp = requests.get(PROXY_URL, params=params, timeout=20)
             if resp.status_code == 401:
-                log.error("Foursquare proxy: invalid API key in Vercel")
+                log.error("Foursquare proxy: invalid API key")
                 return None
             if resp.status_code != 200:
                 log.warning(f"Foursquare proxy HTTP {resp.status_code}: {resp.text[:200]}")
@@ -252,8 +223,13 @@ def fetch_foursquare(keyword, place):
 
 
 def parse_foursquare(venue, keyword, place, job_tags):
-    loc = venue.get("location", {})
+    loc      = venue.get("location", {})
     category = venue.get("categories", [{}])[0].get("name") if venue.get("categories") else None
+    today    = date.today().isoformat()
+    tags     = list(job_tags)
+    for t in [keyword, place, today, "foursquare"]:
+        if t and t not in tags:
+            tags.append(t)
     return {
         "business_name":  venue.get("name"),
         "telephone":      venue.get("tel"),
@@ -268,35 +244,34 @@ def parse_foursquare(venue, keyword, place, job_tags):
         "listing_url":    f"https://foursquare.com/v/{venue.get('fsq_id','')}",
         "search_keyword": keyword,
         "search_place":   place,
-        "tags":           make_tags(keyword, place, job_tags, "foursquare"),
+        "tags":           tags,
         "scraped_at":     datetime.utcnow().isoformat(),
     }
 
 
 def scrape_foursquare(keyword, place, job_tags):
+    if not PROXY_URL:
+        return None
     log.info(f"  [Foursquare] '{keyword}' near '{place}'")
     venues = fetch_foursquare(keyword, place)
     if venues is None:
-        log.warning("  [Foursquare] failed -- trying next provider")
+        log.warning("  [Foursquare] failed -- will try next provider")
         return None
     results = [parse_foursquare(v, keyword, place, job_tags) for v in venues]
     log.info(f"  [Foursquare] -> {len(results)} results")
-    return results if results else None
+    return results
 
 
-# ── Yelp ─────────────────────────────────────────────────────────────────────
-
+# ── Provider: Yelp ────────────────────────────────────────────────────────────
 YELP_SEARCH_URL = "https://api.yelp.com/v3/businesses/search"
+YELP_HEADERS    = {"Authorization": f"Bearer {YELP_KEY}", "Accept": "application/json"}
 
 
 def fetch_yelp(keyword, place, offset=0):
-    if not YELP_KEY:
-        return None, 0
-    headers = {"Authorization": f"Bearer {YELP_KEY}", "Accept": "application/json"}
-    params  = {"term": keyword, "location": place, "limit": 50, "offset": offset}
+    params = {"term": keyword, "location": place, "limit": 50, "offset": offset}
     for attempt in range(3):
         try:
-            resp = requests.get(YELP_SEARCH_URL, headers=headers, params=params, timeout=15)
+            resp = requests.get(YELP_SEARCH_URL, headers=YELP_HEADERS, params=params, timeout=15)
             if resp.status_code == 401:
                 log.error("Yelp: invalid API key")
                 return None, 0
@@ -313,11 +288,16 @@ def fetch_yelp(keyword, place, offset=0):
 
 
 def parse_yelp(biz, keyword, place, job_tags):
-    loc = biz.get("location", {})
+    loc   = biz.get("location", {})
+    today = date.today().isoformat()
+    tags  = list(job_tags)
+    for t in [keyword, place, today, "yelp"]:
+        if t and t not in tags:
+            tags.append(t)
     return {
         "business_name":  biz.get("name"),
         "telephone":      biz.get("phone") or biz.get("display_phone"),
-        "website":        biz.get("url"),
+        "website":        None,  # Yelp search doesn't return the real business website
         "street":         (loc.get("display_address") or [None])[0],
         "locality":       loc.get("city"),
         "region":         loc.get("state"),
@@ -328,7 +308,7 @@ def parse_yelp(biz, keyword, place, job_tags):
         "listing_url":    biz.get("url"),
         "search_keyword": keyword,
         "search_place":   place,
-        "tags":           make_tags(keyword, place, job_tags, "yelp"),
+        "tags":           tags,
         "scraped_at":     datetime.utcnow().isoformat(),
     }
 
@@ -341,7 +321,7 @@ def scrape_yelp(keyword, place, job_tags):
     while offset < 200:
         businesses, total = fetch_yelp(keyword, place, offset)
         if businesses is None:
-            log.warning("  [Yelp] failed -- trying next provider")
+            log.warning("  [Yelp] failed -- will try next provider")
             return None
         if not businesses:
             break
@@ -351,13 +331,19 @@ def scrape_yelp(keyword, place, job_tags):
             break
         time.sleep(0.3)
     log.info(f"  [Yelp] -> {len(all_results)} results")
-    return all_results if all_results else None
+    return all_results
 
 
-# ── Provider fallback chain ───────────────────────────────────────────────────
+# ── Provider cycling ──────────────────────────────────────────────────────────
+PROVIDERS = [
+    ("Foursquare", scrape_foursquare),
+    ("Yelp",       scrape_yelp),
+]
+
 
 def scrape_with_fallback(keyword, place, job_tags):
-    for name, fn in [("Foursquare", scrape_foursquare), ("Yelp", scrape_yelp)]:
+    """Try each provider in order; return first non-empty result."""
+    for name, fn in PROVIDERS:
         try:
             results = fn(keyword, place, job_tags)
         except Exception as e:
@@ -365,17 +351,16 @@ def scrape_with_fallback(keyword, place, job_tags):
             results = None
         if results:
             return results
-        log.info(f"  [{name}] no results -- trying next provider")
+        log.info(f"  [{name}] empty/failed -- trying next provider")
     log.error(f"  All providers failed for '{keyword}' / '{place}'")
     return []
 
 
 # ── Main agent ────────────────────────────────────────────────────────────────
-
 def run_agent():
     log.info("=" * 60)
     log.info(f"Agent started -- {datetime.utcnow().isoformat()} UTC")
-    log.info(f"Providers: Foursquare=proxy | Yelp={'yes' if YELP_KEY else 'no'}")
+    log.info(f"Providers configured: Foursquare proxy={bool(PROXY_URL)} | Yelp={'yes' if YELP_KEY else 'no'}")
     jobs            = load_jobs()
     existing_phones = get_existing_phones()
     log.info(f"Existing leads in DB: {len(existing_phones)}")
@@ -384,8 +369,8 @@ def run_agent():
     for job in jobs:
         log.info(f"Job: '{job['keyword']}' / '{job['place']}'")
         records = scrape_with_fallback(job["keyword"], job["place"], job.get("tags", []))
-        total_scraped += len(records)
         inserted_records, count = push_to_supabase(records, existing_phones)
+        total_scraped  += len(records)
         total_inserted += count
         existing_phones.update(r["telephone"] for r in records if r.get("telephone"))
         enrich_emails(inserted_records)
@@ -395,7 +380,6 @@ def run_agent():
 
 
 # ── Scheduler ─────────────────────────────────────────────────────────────────
-
 cfg            = load_config()
 SCHEDULE       = os.environ.get("SCHEDULE",        cfg.get("SCHEDULE",        "weekly"))
 RUN_HOUR       = os.environ.get("RUN_HOUR",        cfg.get("RUN_HOUR",        "06:00"))
